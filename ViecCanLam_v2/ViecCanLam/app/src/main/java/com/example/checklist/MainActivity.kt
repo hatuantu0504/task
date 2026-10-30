@@ -1,6 +1,8 @@
 package com.example.checklist
 
 import android.Manifest
+import android.animation.ObjectAnimator
+import android.animation.ValueAnimator
 import android.app.*
 import android.appwidget.AppWidgetManager
 import android.appwidget.AppWidgetProvider
@@ -13,13 +15,17 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.view.animation.DecelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.view.inputmethod.EditorInfo
 import android.widget.*
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.LocalDate
 import java.time.ZoneId
+import kotlin.math.abs
 
 class Item(val id: Int, var text: String, var done: Boolean, var day: Long, var min: Int)
 
@@ -98,11 +104,11 @@ class TaskWidget : AppWidgetProvider() {
             val today = LocalDate.now().toEpochDay()
             val list = Store.load(c).filter { it.day == today }.sortedBy { if (it.min < 0) 9999 else it.min }
             val v = RemoteViews(c.packageName, R.layout.widget)
-            v.setTextViewText(R.id.w_title, "Hôm nay · ${list.count { it.done }}/${list.size} xong")
+            v.setTextViewText(R.id.w_title, "Hôm nay · ${list.count { it.done }}/${list.size}")
             v.setTextViewText(
                 R.id.w_body,
                 if (list.isEmpty()) "Chưa có việc nào cho hôm nay ✨"
-                else list.take(6).joinToString("\n") { (if (it.done) "☑ " else "☐ ") + (if (it.min >= 0) hm(it.min) + "  " else "") + it.text }
+                else list.take(4).joinToString("\n") { (if (it.done) "☑ " else "☐ ") + (if (it.min >= 0) hm(it.min) + "  " else "") + it.text }
             )
             v.setOnClickPendingIntent(R.id.w_root, Alarms.openApp(c))
             return v
@@ -112,6 +118,22 @@ class TaskWidget : AppWidgetProvider() {
             val m = AppWidgetManager.getInstance(c)
             m.getAppWidgetIds(ComponentName(c, TaskWidget::class.java)).forEach { m.updateAppWidget(it, build(c)) }
         }
+    }
+}
+
+class SwipeRail(c: Context) : FrameLayout(c) {
+    var onSwipeLeft: () -> Unit = {}
+    private var x0 = 0f
+    private var y0 = 0f
+    override fun onInterceptTouchEvent(e: MotionEvent): Boolean {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> { x0 = e.x; y0 = e.y }
+            MotionEvent.ACTION_MOVE -> {
+                val dx = e.x - x0
+                if (dx < -40 * resources.displayMetrics.density && abs(dx) > abs(e.y - y0)) { onSwipeLeft(); return true }
+            }
+        }
+        return false
     }
 }
 
@@ -127,7 +149,12 @@ class MainActivity : Activity() {
     private var selMin = -1
     private var draft = ""
     private var scroll: ScrollView? = null
-    private lateinit var rail: LinearLayout
+    private var animIn = true
+    private var popId = -1
+    private lateinit var rail: SwipeRail
+    private lateinit var railIn: LinearLayout
+    private lateinit var divider: View
+    private lateinit var handle: View
     private lateinit var content: FrameLayout
 
     private val PURPLE = 0xFF8B5CF6.toInt()
@@ -174,13 +201,28 @@ class MainActivity : Activity() {
             colors = intArrayOf((color and 0x00FFFFFF) or 0x66000000, color and 0x00FFFFFF)
         }
         layoutParams = FrameLayout.LayoutParams(dp(size), dp(size), g).apply { setMargins(dp(m), dp(m), dp(m), dp(m)) }
+        ObjectAnimator.ofFloat(this, "alpha", 0.45f, 1f).apply {
+            duration = 3800; repeatCount = ValueAnimator.INFINITE; repeatMode = ValueAnimator.REVERSE; start()
+        }
+    }
+
+    private fun <T : View> T.pressable(): T {
+        setOnTouchListener { v, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> v.animate().scaleX(0.94f).scaleY(0.94f).setDuration(90).start()
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                    v.animate().scaleX(1f).scaleY(1f).setDuration(220).setInterpolator(OvershootInterpolator()).start()
+            }
+            false
+        }
+        return this
     }
 
     private fun chip(label: String, on: Boolean, click: () -> Unit) =
         tv(label, 13f, if (on) Color.WHITE else SOFT, on).apply {
             gravity = Gravity.CENTER; setPadding(dp(14), dp(9), dp(14), dp(9))
             background = if (on) grad(PURPLE, BLUE, 20) else box(0xFF0F0F1C.toInt(), 20, 1, LINE)
-            setOnClickListener { click() }
+            setOnClickListener { click() }; pressable()
         }
 
     private fun chipRow(vararg v: View) = HorizontalScrollView(this).apply {
@@ -211,16 +253,37 @@ class MainActivity : Activity() {
         root.addView(glow(PURPLE, 300, Gravity.TOP or Gravity.END, -110))
         root.addView(glow(BLUE, 300, Gravity.BOTTOM or Gravity.START, -120))
 
-        rail = LinearLayout(this).apply {
-            orientation = VERT; gravity = Gravity.CENTER_HORIZONTAL
+        railIn = LinearLayout(this).apply { orientation = VERT; gravity = Gravity.CENTER_HORIZONTAL }
+        rail = SwipeRail(this).apply {
             background = box(0xCC0C0C1A.toInt(), 0)
+            addView(railIn, FrameLayout.LayoutParams(dp(76), -1))
+            onSwipeLeft = { post { setRail(false) } }
         }
+        divider = View(this).apply { setBackgroundColor(LINE) }
         content = FrameLayout(this)
         val row = LinearLayout(this).apply { orientation = HORIZ }
         row.addView(rail, lp(dp(76), -1))
-        row.addView(View(this).apply { setBackgroundColor(LINE) }, lp(dp(1), -1))
+        row.addView(divider, lp(dp(1), -1))
         row.addView(content, lp(0, -1, 1f))
         root.addView(row, FrameLayout.LayoutParams(-1, -1))
+
+        // Mũi tên mờ ở mép trái khi thanh bên đã ẩn: chạm hoặc vuốt sang phải để mở lại
+        handle = FrameLayout(this).apply {
+            visibility = View.GONE
+            addView(tv("›", 22f, 0xAAFFFFFF.toInt(), true).apply {
+                gravity = Gravity.CENTER; background = box(0x26FFFFFF, 14)
+            }, FrameLayout.LayoutParams(dp(20), dp(64), Gravity.CENTER_VERTICAL))
+            var x0 = 0f
+            setOnTouchListener { _, e ->
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> x0 = e.rawX
+                    MotionEvent.ACTION_MOVE -> if (e.rawX - x0 > dp(24)) { x0 = Float.MAX_VALUE; post { setRail(true) } }
+                    MotionEvent.ACTION_UP -> if (abs(e.rawX - x0) < dp(8)) post { setRail(true) }
+                }
+                true
+            }
+        }
+        root.addView(handle, FrameLayout.LayoutParams(dp(26), -1, Gravity.START))
         setContentView(root)
         refresh()
     }
@@ -231,23 +294,53 @@ class MainActivity : Activity() {
         content.addView(if (tab == 0) pageAdd() else pageList())
     }
 
-    // ---------- Thanh bên trái (thu gọn được) ----------
-    private fun buildRail() {
-        rail.removeAllViews()
-        rail.layoutParams = lp(dp(if (railOpen) 76 else 40), -1)
-        val side = if (railOpen) 8 else 4
-        rail.setPadding(dp(side), dp(28), dp(side), dp(16))
-        val toggle = tv(if (railOpen) "‹" else "›", 22f, Color.WHITE, true).apply {
-            gravity = Gravity.CENTER; background = box(0xFF1E1E33.toInt(), 14, 1, LINE)
-            setOnClickListener { railOpen = !railOpen; refresh() }
+    // ---------- Thanh bên trái (vuốt sang trái để ẩn) ----------
+    private fun goTab(i: Int) {
+        if (i == tab) return
+        val dir = if (i > tab) 1 else -1
+        tab = i; deleting = false; picked.clear(); sy = 0; animIn = true
+        buildRail()
+        content.animate().alpha(0f).translationX(-dir * dp(28).toFloat()).setDuration(130).withEndAction {
+            refresh()
+            content.translationX = dir * dp(28).toFloat()
+            content.animate().alpha(1f).translationX(0f).setDuration(260).setInterpolator(DecelerateInterpolator()).start()
+        }.start()
+    }
+
+    private fun setRail(open: Boolean) {
+        if (railOpen == open) return
+        railOpen = open
+        if (open) { divider.visibility = View.VISIBLE; handle.visibility = View.GONE }
+        ValueAnimator.ofInt(rail.width, if (open) dp(76) else 0).apply {
+            duration = 280; interpolator = DecelerateInterpolator()
+            addUpdateListener {
+                rail.layoutParams = rail.layoutParams.apply { width = it.animatedValue as Int }
+                rail.alpha = if (open) it.animatedFraction else 1f - it.animatedFraction
+            }
+            start()
         }
-        if (!railOpen) { rail.addView(toggle, lp(dp(32), dp(40))); return }
+        if (!open) rail.postDelayed({
+            if (!railOpen) {
+                divider.visibility = View.GONE
+                handle.alpha = 0f; handle.visibility = View.VISIBLE
+                handle.animate().alpha(1f).setDuration(250).start()
+            }
+        }, 290)
+    }
+
+    private fun buildRail() {
+        railIn.removeAllViews()
+        railIn.setPadding(dp(8), dp(28), dp(8), dp(16))
+        val toggle = tv("‹", 22f, Color.WHITE, true).apply {
+            gravity = Gravity.CENTER; background = box(0xFF1E1E33.toInt(), 14, 1, LINE)
+            setOnClickListener { setRail(false) }; pressable()
+        }
         val logo = tv("✓", 24f, Color.WHITE, true).apply { gravity = Gravity.CENTER; background = grad(PURPLE, BLUE, 16) }
-        rail.addView(logo, lp(dp(48), dp(48)).apply { bottomMargin = dp(32) })
-        rail.addView(navBtn(0, "＋", "Thêm việc"))
-        rail.addView(navBtn(1, "☰", "Danh sách"))
-        rail.addView(View(this), lp(1, 0, 1f))
-        rail.addView(toggle, lp(-1, dp(40)))
+        railIn.addView(logo, lp(dp(48), dp(48)).apply { bottomMargin = dp(32) })
+        railIn.addView(navBtn(0, "＋", "Thêm việc"))
+        railIn.addView(navBtn(1, "☰", "Danh sách"))
+        railIn.addView(View(this), lp(1, 0, 1f))
+        railIn.addView(toggle, lp(-1, dp(40)))
     }
 
     private fun navBtn(i: Int, icon: String, label: String): View {
@@ -260,7 +353,7 @@ class MainActivity : Activity() {
             addView(tv(icon, 22f, if (on) Color.WHITE else MUTE, true).apply { gravity = Gravity.CENTER })
             addView(tv(label, 10.5f, if (on) Color.WHITE else MUTE).apply { gravity = Gravity.CENTER })
             layoutParams = lp(-1, -2).apply { bottomMargin = dp(10) }
-            setOnClickListener { tab = i; deleting = false; picked.clear(); sy = 0; refresh() }
+            setOnClickListener { goTab(i) }; pressable()
         }
     }
 
@@ -283,7 +376,10 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(14), dp(16), dp(14))
         }
         val info = tv("", 13f, MUTE).apply { setPadding(0, dp(14), 0, 0) }
-        fun upd(msg: String? = null) { info.text = msg ?: "Hiện có ${items.size} việc trong danh sách" }
+        fun upd(msg: String? = null) {
+            info.text = msg ?: "Hiện có ${items.size} việc trong danh sách"
+            info.alpha = 0f; info.animate().alpha(1f).setDuration(350).start()
+        }
         fun keep(b: () -> Unit) { draft = input.text.toString(); b(); refresh() }
 
         val t = LocalDate.now().toEpochDay()
@@ -319,7 +415,7 @@ class MainActivity : Activity() {
         input.setOnEditorActionListener { _, _, _ -> add(); true }
         val btn = tv("＋  Thêm vào danh sách", 16f, Color.WHITE, true).apply {
             gravity = Gravity.CENTER; setPadding(0, dp(16), 0, dp(16)); background = grad(PURPLE, BLUE, 16)
-            setOnClickListener { add() }
+            setOnClickListener { add() }; pressable()
         }
         upd()
         card.addView(input)
@@ -334,6 +430,7 @@ class MainActivity : Activity() {
         val wbtn = tv("📌  Thêm widget ra màn hình chính", 14f, Color.WHITE, true).apply {
             gravity = Gravity.CENTER; setPadding(0, dp(15), 0, dp(15))
             background = box(0x228B5CF6, 16, 1, 0x668B5CF6)
+            pressable()
             setOnClickListener {
                 val m = AppWidgetManager.getInstance(this@MainActivity)
                 if (m.isRequestPinAppWidgetSupported)
@@ -363,15 +460,15 @@ class MainActivity : Activity() {
         val trash = tv(if (deleting) "Hủy" else "🗑", if (deleting) 14f else 20f, Color.WHITE, deleting).apply {
             gravity = Gravity.CENTER
             background = box(0xFF1E1E33.toInt(), 14, 1, if (deleting) PINK else LINE)
-            setOnClickListener { deleting = !deleting; picked.clear(); refresh() }
+            setOnClickListener { deleting = !deleting; picked.clear(); refresh() }; pressable()
         }
         head.addView(trash, lp(dp(if (deleting) 64 else 44), dp(44)))
         p.addView(head)
 
         p.addView(chipRow(
-            chip("Hôm nay", view == 0) { view = 0; sy = 0; refresh() },
-            chip("Ngày mai", view == 1) { view = 1; sy = 0; refresh() },
-            chip("Tất cả", view == 2) { view = 2; sy = 0; refresh() }
+            chip("Hôm nay", view == 0) { view = 0; sy = 0; animIn = true; refresh() },
+            chip("Ngày mai", view == 1) { view = 1; sy = 0; animIn = true; refresh() },
+            chip("Tất cả", view == 2) { view = 2; sy = 0; animIn = true; refresh() }
         ), lp(-1, -2).apply { topMargin = dp(16) })
 
         if (!deleting) {
@@ -402,15 +499,23 @@ class MainActivity : Activity() {
             })
         }
         var last = Long.MIN_VALUE
+        var idx = 0
         shown.forEach {
             if (view == 2 && it.day != last) {
                 col.addView(tv(dayLabel(it.day), 13f, 0xFFA78BFA.toInt(), true).apply { setPadding(dp(4), dp(12), 0, dp(8)) })
                 last = it.day
             }
-            col.addView(row(it), lp(-1, -2).apply { bottomMargin = dp(10) })
+            val rv = row(it)
+            if (animIn) {
+                rv.alpha = 0f; rv.translationY = dp(14).toFloat()
+                rv.animate().alpha(1f).translationY(0f).setStartDelay((idx++ * 45L).coerceAtMost(500L))
+                    .setDuration(320).setInterpolator(DecelerateInterpolator()).start()
+            }
+            col.addView(rv, lp(-1, -2).apply { bottomMargin = dp(10) })
         }
         val sv = ScrollView(this).apply { addView(col); isVerticalScrollBarEnabled = false }
         scroll = sv
+        animIn = false
         sv.post { sv.scrollTo(0, sy) }
         p.addView(sv, lp(-1, 0, 1f).apply { topMargin = dp(14) })
 
@@ -446,6 +551,11 @@ class MainActivity : Activity() {
             else box(0, rad, 2, MUTE)
         }
         r.addView(mark, lp(dp(26), dp(26)))
+        if (item.id == popId) {
+            mark.scaleX = 0.5f; mark.scaleY = 0.5f
+            mark.animate().scaleX(1f).scaleY(1f).setDuration(380).setInterpolator(OvershootInterpolator(3f)).start()
+            popId = -1
+        }
         val texts = LinearLayout(this).apply { orientation = VERT; setPadding(dp(14), 0, 0, 0) }
         val strike = item.done && !deleting
         texts.addView(tv(item.text, 17f, if (strike) MUTE else Color.WHITE).apply {
@@ -456,9 +566,10 @@ class MainActivity : Activity() {
         r.setOnClickListener {
             sy = scroll?.scrollY ?: 0
             if (deleting) { if (!picked.remove(item)) picked.add(item) }
-            else { item.done = !item.done; Alarms.set(this, item) }
+            else { item.done = !item.done; popId = item.id; Alarms.set(this, item) }
             save(); refresh()
         }
+        r.pressable()
         return r
     }
 }
